@@ -3,8 +3,10 @@ use std::time::Instant;
 
 use pg_sys::{FunctionCall0Coll, InvalidOid};
 use pgrx::ffi::c_char;
+use std::ffi::c_int;
 use pgrx::pg_sys::{
-    index_getprocinfo, pgstat_progress_update_param, AsPgCStr, ConditionVariable, Oid,
+    index_getprocinfo, pgstat_progress_incr_param, pgstat_progress_update_param, AsPgCStr,
+    ConditionVariable, Oid, PROGRESS_CREATEIDX_TUPLES_DONE, PROGRESS_CREATEIDX_TUPLES_TOTAL,
 };
 use pgrx::*;
 
@@ -429,6 +431,14 @@ pub extern "C-unwind" fn ambuild(
 
     let ntuples = if let Some(ParallelData { pcxt, snapshot }) = parallel_data {
         unsafe {
+            // Workers are running: transition the leader's phase so that
+            // pg_stat_progress_create_index doesn't stay frozen on "training quantizer".
+            pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_BUILDING_GRAPH);
+            pgstat_progress_update_param(
+                PROGRESS_CREATEIDX_TUPLES_TOTAL as c_int,
+                heap_tuples as i64,
+            );
+
             pg_sys::WaitForParallelWorkersToFinish(pcxt);
             let parallel_shared: *mut ParallelShared =
                 pg_sys::shm_toc_lookup((*pcxt).toc, parallel::SHM_TOC_SHARED_KEY, false)
@@ -437,6 +447,11 @@ pub extern "C-unwind" fn ambuild(
                 .build_state
                 .ntuples
                 .load(Ordering::Relaxed);
+            // Show final count on the leader row once workers are done.
+            pgstat_progress_update_param(
+                PROGRESS_CREATEIDX_TUPLES_DONE as c_int,
+                ntuples as i64,
+            );
             parallel::cleanup_parallel_context(pcxt, snapshot);
             ntuples
         }
@@ -695,6 +710,29 @@ pub extern "C-unwind" fn _vectorscale_build_main(
     let index_relation = unsafe { PgRelation::from_pg(indexrel) };
     let meta_page = MetaPage::fetch(&index_relation);
 
+    unsafe {
+        pg_sys::pgstat_progress_start_command(
+            pg_sys::ProgressCommandType::PROGRESS_COMMAND_CREATE_INDEX,
+            params.indexrelid,
+        );
+        // Workers start fresh — set the params that PG's index_build normally sets for the leader
+        // AM OID is needed by pg_indexam_progress_phasename() to resolve subphase names
+        let am_oid = (*indexrel).rd_rel.as_ref().unwrap().relam;
+        pgstat_progress_update_param(
+            pg_sys::PROGRESS_CREATEIDX_ACCESS_METHOD_OID.to_u32() as c_int,
+            am_oid.to_u32() as i64,
+        );
+        pgstat_progress_update_param(
+            pg_sys::PROGRESS_CREATEIDX_PHASE as c_int,
+            pg_sys::PROGRESS_CREATEIDX_PHASE_BUILD as i64,
+        );
+        pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_BUILDING_GRAPH);
+        pgstat_progress_update_param(
+            PROGRESS_CREATEIDX_TUPLES_TOTAL as c_int,
+            (*parallel_shared).params.total_vectors as i64,
+        );
+    }
+
     do_heap_scan(
         index_info,
         &heap_relation,
@@ -710,6 +748,7 @@ pub extern "C-unwind" fn _vectorscale_build_main(
     );
 
     unsafe {
+        pg_sys::pgstat_progress_end_command();
         pg_sys::index_close(indexrel, index_lockmode);
         pg_sys::table_close(heaprel, heap_lockmode);
     }
@@ -726,6 +765,13 @@ fn do_heap_scan(
 ) -> usize {
     unsafe {
         pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_BUILDING_GRAPH);
+
+        let total_tuples: i64 = if let Some(ref info) = parallel_build_info {
+            (*info.parallel_shared).params.total_vectors as i64
+        } else {
+            (heap_relation.rd_rel.as_ref().unwrap().reltuples as i64).max(0)
+        };
+        pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_TOTAL as c_int, total_tuples);
     }
 
     let storage = meta_page.get_storage_type();
@@ -773,8 +819,12 @@ fn do_heap_scan(
                     );
                 }
 
-                // In parallel mode, nodes are finalized during insertion via streaming
-                // Just need to handle any remaining cached nodes and update meta page
+                unsafe {
+                    pgstat_progress_update_param(
+                        PROGRESS_CREATE_IDX_SUBPHASE,
+                        BUILD_PHASE_FINALIZING_GRAPH,
+                    );
+                }
                 finalize_remaining_parallel_nodes(&mut plain, bs, index_relation, write_stats)
             }
             StorageType::SbqCompression => {
@@ -852,6 +902,12 @@ fn do_heap_scan(
                     );
                 }
 
+                unsafe {
+                    pgstat_progress_update_param(
+                        PROGRESS_CREATE_IDX_SUBPHASE,
+                        BUILD_PHASE_FINALIZING_GRAPH,
+                    );
+                }
                 finalize_index_build(&mut plain, bs, index_relation, write_stats)
             }
             StorageType::SbqCompression => {
@@ -1078,6 +1134,9 @@ fn build_callback_internal<S: Storage>(
     check_for_interrupts!();
 
     state.ntuples += 1;
+    unsafe {
+        pgstat_progress_incr_param(PROGRESS_CREATEIDX_TUPLES_DONE as c_int, 1);
+    }
 
     let index_pointer = storage.create_node(
         vector.vec().to_index_slice(),
@@ -1122,6 +1181,9 @@ fn build_callback_parallel_internal<S: Storage>(
     check_for_interrupts!();
 
     state.increment_ntuples();
+    unsafe {
+        pgstat_progress_incr_param(PROGRESS_CREATEIDX_TUPLES_DONE as c_int, 1);
+    }
 
     // Create node using local tape - PostgreSQL page locking handles concurrency
     let index_pointer = storage.create_node(

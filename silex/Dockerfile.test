@@ -1,0 +1,72 @@
+# Test image: PostgreSQL 18 + pgvector + pgvectorscale (local source)
+# Build from repo root: docker build -f Dockerfile.test -t pgvectorscale-test .
+# Run:  docker run --rm -p 5432:5432 pgvectorscale-test
+# Then: psql -h localhost -U postgres -d test
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── System packages ─────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y \
+    wget gnupg2 lsb-release ca-certificates \
+    build-essential git pkg-config curl \
+    clang llvm libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── PostgreSQL 18 from official repo ────────────────────────────────────────
+RUN echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - \
+    && apt-get update \
+    && apt-get install -y postgresql-18 postgresql-server-dev-18 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/usr/lib/postgresql/18/bin:${PATH}"
+
+# ── Rust ────────────────────────────────────────────────────────────────────
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# AVX2 requis par pgvectorscale (équivalent du .cargo/config.toml à la racine du repo)
+ENV RUSTFLAGS="-C target-feature=+avx2,+fma"
+
+# ── cargo-pgrx 0.16.1 ───────────────────────────────────────────────────────
+RUN cargo install cargo-pgrx --version 0.16.1 --locked \
+    && cargo pgrx init --pg18="$(which pg_config)"
+
+# ── pgvector (required by pgvectorscale) ────────────────────────────────────
+RUN git clone --depth 1 --branch v0.8.1 https://github.com/pgvector/pgvector.git /tmp/pgvector \
+    && cd /tmp/pgvector \
+    && make -j"$(nproc)" \
+    && make install \
+    && rm -rf /tmp/pgvector
+
+# ── pgvectorscale (local source, avec les changements en cours) ─────────────
+COPY pgvectorscale/ /build/pgvectorscale/
+WORKDIR /build
+RUN cd pgvectorscale \
+    && cargo pgrx install --no-default-features --features pg18,build_parallel \
+    && cargo clean \
+    && rm -rf /root/.cargo/registry /root/.cargo/git
+
+# ── Init PostgreSQL ──────────────────────────────────────────────────────────
+RUN mkdir -p /var/lib/postgresql/data \
+    && chown -R postgres:postgres /var/lib/postgresql
+
+USER postgres
+RUN initdb -D /var/lib/postgresql/data \
+    && echo "listen_addresses = '*'"          >> /var/lib/postgresql/data/postgresql.conf \
+    && echo "host all all 0.0.0.0/0 trust"   >> /var/lib/postgresql/data/pg_hba.conf
+
+# Crée la base de test et installe les extensions au premier démarrage
+RUN pg_ctl -D /var/lib/postgresql/data -l /tmp/pg.log start \
+    && sleep 2 \
+    && psql -U postgres -c "CREATE DATABASE test;" \
+    && psql -U postgres -d test -c "CREATE EXTENSION vector;" \
+    && psql -U postgres -d test -c "CREATE EXTENSION vectorscale;" \
+    && pg_ctl -D /var/lib/postgresql/data stop
+
+EXPOSE 5432
+
+CMD ["postgres", "-D", "/var/lib/postgresql/data"]

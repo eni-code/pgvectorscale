@@ -1,3 +1,9 @@
+> **Silex's copy.** This is Timescale's pgvectorscale 0.9.0 with one change by Silex, on
+> the branch `progress-reporting`: building a StreamingDiskANN index reports the progress of
+> every phase in `pg_stat_progress_create_index` (`pgvectorscale/src/access_method/build.rs`).
+> `silex/` holds a test image (PostgreSQL 18, pgvector and this build) and the SQL script that
+> watches the progress. Timescale's README follows.
+
 <p></p>
 <div align=center>
 
